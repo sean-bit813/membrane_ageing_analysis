@@ -1,225 +1,241 @@
+import json
+import fitz  # PyMuPDF
 from pathlib import Path
 import logging
-from typing import Dict, List, Optional
-from grobid_client.grobid_client import GrobidClient
-import camelot
-import xml.etree.ElementTree as ET
-import pandas as pd
+from typing import Dict, List
 import re
+from llm_preprocessing_api import call_doubao_api
+from section_processor import SectionProcessor
 
 
-class ScientificPaperProcessor:
-    """
-    A comprehensive processor for scientific papers utilizing GROBID and specialized tools
-    for extracting structured content including metadata, sections, tables, and references.
-    """
-
-    def __init__(self, grobid_url: str = "http://localhost:8070", output_dir: Optional[Path] = None):
-        """
-        Initialize the processor with GROBID client and output configuration.
-
-        Args:
-            grobid_url: URL of GROBID service
-            output_dir: Directory for storing processed outputs
-        """
-        self.grobid_client = GrobidClient(grobid_url)
+class PDFProcessor:
+    def __init__(self, output_dir: Path = None):
         self.output_dir = output_dir
-        self.logger = logging.getLogger(__name__)
-
         if output_dir:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-    def process_paper(self, pdf_path: Path) -> Dict:
-        """
-        Process scientific paper to extract structured content.
+    def _save_content(self, content: Dict):
 
-        Args:
-            pdf_path: Path to PDF file
+        """Save extracted content to a single consolidated JSON file"""
+        if not self.output_dir:
+            return
 
-        Returns:
-            Dictionary containing structured paper content
-        """
-        try:
-            # Extract structured content using GROBID
-            xml_content = self.grobid_client.process_pdf(
-                str(pdf_path), "processFulltextDocument")
-            tree = ET.fromstring(xml_content)
+        paper_id = content['paper_id']
 
-            # Extract components
-            metadata = self._extract_metadata(tree)
-            sections = self._extract_sections(tree)
-            tables = self._extract_tables(pdf_path)
-            references = self._extract_references(tree)
-
-            paper_content = {
-                'paper_id': pdf_path.stem,
-                'metadata': metadata,
-                'sections': sections,
-                'tables': tables,
-                'references': references
-            }
-
-            # Save if output directory specified
-            if self.output_dir:
-                self._save_content(paper_content)
-
-            return paper_content
-
-        except Exception as e:
-            self.logger.error(f"Error processing {pdf_path}: {str(e)}")
-            raise
-
-    def _extract_metadata(self, tree: ET.Element) -> Dict:
-        """Extract metadata from GROBID XML"""
-        header = tree.find('.//teiHeader/fileDesc/titleStmt')
-        authors = []
-        for author in tree.findall('.//teiHeader//author'):
-            author_name = []
-            for name_part in author.findall('.//persName//*'):
-                if name_part.text:
-                    author_name.append(name_part.text.strip())
-            if author_name:
-                authors.append(' '.join(author_name))
-
-        return {
-            'title': header.findtext('.//title'),
-            'authors': authors,
-            'abstract': tree.findtext('.//abstract'),
-            'keywords': [kw.text for kw in tree.findall('.//keyword')],
-            'journal': tree.findtext('.//journal-title'),
-            'doi': tree.findtext('.//idno[@type="DOI"]'),
-            'publication_date': tree.findtext('.//publicationStmt/date')
+        # Consolidate all components into a single dictionary
+        consolidated_content = {
+            'paper_id': paper_id,
+            'metadata': content['metadata'],
+            'sections': content['sections'],
+            'references': content['references']
         }
 
-    def _extract_sections(self, tree: ET.Element) -> Dict:
-        """Extract sections from GROBID XML"""
-        sections = {}
-        for div in tree.findall('.//body//div'):
-            head = div.findtext('./head')
-            if head:
-                # Combine all text content in section
-                text_parts = []
-                for p in div.findall('.//p'):
-                    if p.text:
-                        text_parts.append(p.text.strip())
-                sections[head.strip()] = '\n'.join(text_parts)
-        return sections
+        # Save as a single JSON file
+        output_file = self.output_dir / f'{paper_id}_consolidated.json'
 
-    def _extract_tables(self, pdf_path: Path) -> List[Dict]:
-        """Extract tables using Camelot"""
-        tables = camelot.read_pdf(str(pdf_path), pages='all')
-        extracted_tables = []
+        # Use json module with indentation for readability
+        import json
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(consolidated_content, f, indent=4, ensure_ascii=False)
 
-        for table in tables:
-            # Extract table caption if available
-            caption = self._find_table_caption(table.page)
+        logging.info(f"Saved consolidated content to {output_file}")
 
-            table_data = {
-                'page': table.page,
-                'content': table.df.to_dict(),
-                'accuracy': table.accuracy,
-                'caption': caption,
-                'rows': table.shape[0],
-                'columns': table.shape[1]
+    def process_paper(self, pdf_path: Path) -> Dict:
+        """Process PDF to extract content"""
+        try:
+            doc = fitz.open(pdf_path)
+
+            content = {
+                'paper_id': pdf_path.stem,
+                'metadata': self._extract_metadata(doc),
+                'sections': self._extract_sections(doc),
+                'references': self._extract_references(doc)
             }
-            extracted_tables.append(table_data)
 
-        return extracted_tables
+            # Save content if output directory is specified
+            self._save_content(content)
 
-    def _extract_references(self, tree: ET.Element) -> List[Dict]:
+            return content
+
+        except Exception as e:
+            logging.error(f"Error processing {pdf_path}: {str(e)}")
+            raise
+
+    def _extract_metadata(self, doc: fitz.Document) -> Dict:
+        """Extract metadata from first page using LLM"""
+
+        # Get text from first page
+        first_page = doc[0].get_text()
+        print(first_page[:4000])
+        # Construct prompt for metadata extraction
+        # Construct messages for Doubao API
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert academic metadata extraction assistant. Extract structured metadata from scientific documents."
+            },
+            {
+                "role": "user",
+                "content": f"""Extract precise metadata from the following academic document text:
+
+                Document Text:
+                    {first_page[:4000]}  # Limit context to first page
+                    Extract and provide the following metadata in a strict JSON format:
+                    1. Title (full, exact title)
+                    2. Authors (complete list of authors)
+                    3. Journal Name
+                    4. Publication Year
+                    5. Volume and Issue Number
+                    6. Brief Abstract (if available)
+                    7. Keywords
+                    
+                    Requirements:
+                    - Use exact wording from the document
+                    - Be precise and concise
+                    - Return valid JSON format
+                    - If any field is unclear, use an empty string
+                    
+                    JSON Output Format:
+                    {{
+                        "title": "",
+                        "authors": [],
+                        "journal": "",
+                        "year": "",
+                        "volume": "",
+                        "abstract": "",
+                        "keywords": ""
+                    }}
+                    """
+                            }
+                        ]
+
+        try:
+            # Call Doubao API
+            response_text = call_doubao_api(messages, max_tokens=500)
+
+            # Attempt to parse JSON response
+            try:
+                metadata = json.loads(response_text)
+            except json.JSONDecodeError:
+                # Fallback to regex extraction if JSON parsing fails
+                metadata = self._fallback_metadata_extraction(first_page)
+
+            # Validate metadata
+            #metadata = self._validate_metadata(metadata, first_page)
+
+            return metadata
+
+        except Exception as e:
+            # Fallback to regex extraction in case of any errors
+            print(f"Metadata extraction error: {e}")
+            return self._fallback_metadata_extraction(first_page)
+
+    def _fallback_metadata_extraction(self, text):
+        """Fallback method using regex for metadata extraction"""
+        metadata = {}
+
+        # Title extraction
+        title_pattern = r'^(.*?)(?=\n[A-Z][a-z]+\s+[A-Z][a-z]+|\nAbstract|\n\d{4})'
+        title_match = re.search(title_pattern, text, re.MULTILINE | re.DOTALL)
+        if title_match:
+            metadata['title'] = title_match.group(1).strip()
+
+        # Authors extraction
+        author_pattern = r'([A-Z][a-z]+\s+[A-Z]\.\s+[A-Z][a-z]+(?:,\s*[A-Z][a-z]+\s+[A-Z]\.\s+[A-Z][a-z]+)*)'
+        author_match = re.search(author_pattern, text)
+        if author_match:
+            metadata['authors'] = [author.strip() for author in author_match.group(1).split(',')]
+
+        # Year extraction
+        year_pattern = r'\b(20\d{2})\b'
+        year_match = re.search(year_pattern, text)
+        if year_match:
+            metadata['year'] = year_match.group(1)
+
+        # Journal extraction
+        journal_pattern = r'^(.*?)\s+\d+\s*\(\d{4}\)'
+        journal_match = re.search(journal_pattern, text, re.MULTILINE)
+        if journal_match:
+            metadata['journal'] = journal_match.group(1).strip()
+
+        return metadata
+
+    def _extract_sections(self, doc: fitz.Document) -> Dict[str, str]:
         """
-        Extract and parse references from GROBID XML.
+        Extract sections from two-column scientific paper with structured format.
 
-        Returns structured reference data including authors, title,
-        publication venue, year, and DOI where available.
+        Parameters:
+            doc (fitz.Document): Input PDF document
+
+        Returns:
+            Dict[str, str]: Extracted sections with standardized keys
         """
+        section_processor = SectionProcessor()
+        return section_processor.extract_sections(doc)
+
+
+    def _extract_references(self, doc: fitz.Document) -> List[str]:
+        """Extract references with improved pattern matching"""
         references = []
-        for ref in tree.findall('.//listBibl/biblStruct'):
-            ref_data = {
-                'authors': [],
-                'title': ref.findtext('.//title'),
-                'journal': ref.findtext('.//journal-title'),
-                'year': ref.findtext('.//date/@when'),
-                'volume': ref.findtext('.//biblScope[@unit="volume"]'),
-                'issue': ref.findtext('.//biblScope[@unit="issue"]'),
-                'pages': ref.findtext('.//biblScope[@unit="page"]'),
-                'doi': ref.findtext('.//idno[@type="DOI"]')
-            }
+        text = ""
+        for page in doc:
+            text += page.get_text()
 
-            # Extract author names
-            for author in ref.findall('.//author'):
-                author_name = []
-                for name_part in author.findall('.//persName//*'):
-                    if name_part.text:
-                        author_name.append(name_part.text.strip())
-                if author_name:
-                    ref_data['authors'].append(' '.join(author_name))
+        # Find references section
+        ref_section_match = re.search(r'References\s*(.*?)(?=\n\s*Appendix|\Z)',
+                                      text, re.DOTALL | re.IGNORECASE)
 
-            references.append(ref_data)
+        if ref_section_match:
+            ref_text = ref_section_match.group(1)
+
+            # Match different reference formats
+            ref_patterns = [
+                r'\[\d+\](.*?)(?=\[\d+\]|\Z)',  # [1] style
+                r'^\d+\.\s+(.*?)(?=^\d+\.\s+|\Z)',  # 1. style
+                r'\(\w+\s+et\s+al\.,\s+\d{4}\)(.*?)(?=\(\w+\s+et\s+al\.,\s+\d{4}\)|\Z)'  # (Author et al., year) style
+            ]
+
+            for pattern in ref_patterns:
+                matches = re.finditer(pattern, ref_text, re.MULTILINE | re.DOTALL)
+                for match in matches:
+                    ref = match.group(1).strip()
+                    if ref:  # Only add non-empty references
+                        references.append(ref)
+
+            if references:  # If any pattern worked, return results
+                return references
+
+            # If no patterns worked, try simple line-based splitting
+            references = [line.strip() for line in ref_text.split('\n')
+                          if line.strip() and len(line.strip()) > 20]
 
         return references
 
-    def _save_content(self, content: Dict):
-        """Save extracted content to files"""
-        paper_id = content['paper_id']
-
-        # Save metadata
-        pd.Series(content['metadata']).to_json(
-            self.output_dir / f'{paper_id}_metadata.json')
-
-        # Save sections
-        pd.DataFrame(content['sections'].items(),
-                     columns=['section', 'content']).to_json(
-            self.output_dir / f'{paper_id}_sections.json')
-
-        # Save tables
-        pd.DataFrame(content['tables']).to_json(
-            self.output_dir / f'{paper_id}_tables.json')
-
-        # Save references
-        pd.DataFrame(content['references']).to_json(
-            self.output_dir / f'{paper_id}_references.json')
-
 
 if __name__ == "__main__":
-    import argparse
-
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='Process scientific papers using GROBID')
-    parser.add_argument('../data/raw/1-s2.0-S1383586624022202-main.pdf', type=Path, required=True,
-                        help='Path to PDF file or directory containing PDFs')
-    parser.add_argument('../data/processed', type=Path, required=True,
-                        help='Output directory for processed content')
-    parser.add_argument('--grobid-url', type=str,
-                        default='http://localhost:8070',
-                        help='URL of GROBID service')
+    # Define paths
+    current_dir = Path(__file__).parent
+    input_dir = current_dir.parent.parent / 'data/raw'
+    output_path = current_dir.parent.parent / 'data/processed/consolidated'
 
-    args = parser.parse_args()
+    # Create processor
+    processor = PDFProcessor(output_path)
 
-    try:
-        # Initialize processor
-        processor = ScientificPaperProcessor(
-            grobid_url=args.grobid_url,
-            output_dir=args.output
-        )
+    # Get all PDF files in the input directory
+    pdf_files = list(input_dir.glob('*.pdf'))
 
-        # Process single file or directory
-        if args.input.is_file():
-            result = processor.process_paper(args.input)
-            logging.info(f"Successfully processed {args.input}")
-        elif args.input.is_dir():
-            for pdf_file in args.input.glob('*.pdf'):
-                try:
-                    result = processor.process_paper(pdf_file)
-                    logging.info(f"Successfully processed {pdf_file}")
-                except Exception as e:
-                    logging.error(f"Failed to process {pdf_file}: {str(e)}")
-
-    except Exception as e:
-        logging.error(f"Processing failed: {str(e)}")
+    # Process each PDF
+    for pdf_path in pdf_files:
+        try:
+            result = processor.process_paper(pdf_path)
+            logging.info(f"Successfully processed {pdf_path}")
+            logging.info(f"Found {len(result['sections'])} sections")
+            logging.info(f"Found {len(result['references'])} references")
+        except Exception as e:
+            logging.error(f"Failed to process {pdf_path}: {str(e)}")
